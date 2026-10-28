@@ -46,7 +46,7 @@ export default function AdminPage() {
         const match = pathname.match(/\/admin\/elections\/(.+?)(?:\/|$)/);
         const electionId = match ? match[1] : null;
         if (electionId) {
-            fetch(`/api/elections/${electionId}`)
+            fetch(`/api/elections/${electionId}`, { cache: 'no-store' })
                 .then((res) => (res.ok ? res.json() : null))
                 .then((data) => {
                     if (data) {
@@ -234,7 +234,17 @@ export default function AdminPage() {
                 <OpenVoting setSliderValue={setSliderValue} electionId={selectedElection.id} />
             )}
             {sliderValue === 5 && selectedElection && (
-                <CloseVoting setSliderValue={setSliderValue} electionId={selectedElection.id} />
+                <CloseVoting
+                    setSliderValue={setSliderValue}
+                    electionId={selectedElection.id}
+                    onStatusUpdated={() =>
+                        setSelectedElection((currentElection) =>
+                            currentElection
+                                ? { ...currentElection, status: 'VotingClosed' }
+                                : currentElection
+                        )
+                    }
+                />
             )}
             {sliderValue === 6 && selectedElection && <Results electionId={selectedElection.id} />}
 

@@ -1,6 +1,7 @@
 'use client';
 
 import { Button, Card, CardBody, CardHeader } from '@heroui/react';
+import { HTTPError } from 'ky';
 import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 
@@ -23,6 +24,8 @@ export default function Results({ electionId }: ResultsProps) {
     const [warnings, setWarnings] = useState<string[]>([]);
     const [manualOverrides, setManualOverrides] = useState<Record<string, string[]>>({});
     const [exclusions, setExclusions] = useState<Record<string, string[]>>({});
+    const [isAdjustingResults, setIsAdjustingResults] = useState(false);
+    const [adjustmentError, setAdjustmentError] = useState('');
 
     // Fetch election results
     type ApiResult = { results: PositionResult[] };
@@ -295,33 +298,85 @@ export default function Results({ electionId }: ResultsProps) {
         });
     }, [results]);
 
+    const submitAdjustments = async (
+        nextExclusions: Record<string, string[]>,
+        nextManualOverrides: Record<string, string[]>
+    ) => {
+        setIsAdjustingResults(true);
+        setAdjustmentError('');
+        try {
+            const resp = (await fetcher.post.query([
+                `results/${electionId}`,
+                { json: { exclusions: nextExclusions, manualOverrides: nextManualOverrides } },
+            ])) as ApiResult;
+            setResults(resp.results);
+            setExclusions(nextExclusions);
+            setManualOverrides(nextManualOverrides);
+        } catch (error) {
+            let message = 'Failed to update winners. Please try again.';
+            if (error instanceof HTTPError) {
+                const body: unknown = await error.response.clone().json().catch(() => null);
+                if (
+                    body &&
+                    typeof body === 'object' &&
+                    'error' in body &&
+                    typeof body.error === 'string'
+                ) {
+                    message = body.error;
+                }
+            }
+            setAdjustmentError(message);
+        } finally {
+            setIsAdjustingResults(false);
+        }
+    };
+
     // Remove a candidate from all but the selected position and re-run results
     const handleConfirmSelections = async () => {
         // Build a map of exclusions: for each position, which candidate(s) to exclude
         const exclusions: Record<string, string[]> = {};
-        const manualOverrides: Record<string, string[]> = {};
+        const nextManualOverrides = { ...manualOverrides };
         for (const mw of multiWinners) {
             const keepPos = winnerSelections[mw.id];
+            for (const [positionId, candidateIds] of Object.entries(nextManualOverrides)) {
+                const remaining = candidateIds.filter((candidateId) => candidateId !== mw.id);
+                if (remaining.length > 0) {
+                    nextManualOverrides[positionId] = remaining;
+                } else {
+                    delete nextManualOverrides[positionId];
+                }
+            }
             const isSolo = mw.soloCandidatePositions.includes(keepPos);
             if (isSolo) {
-                // For solo candidate positions, set as manual winner
-                if (!manualOverrides[keepPos]) manualOverrides[keepPos] = [];
-                manualOverrides[keepPos].push(mw.id);
+                nextManualOverrides[keepPos] = [
+                    ...new Set([...(nextManualOverrides[keepPos] || []), mw.id]),
+                ];
             }
             for (const pos of results) {
                 if (pos.position_id !== keepPos) {
-                    if (!exclusions[pos.position_id]) exclusions[pos.position_id] = [];
-                    exclusions[pos.position_id].push(mw.id);
+                    exclusions[pos.position_id] = [
+                        ...new Set([...(exclusions[pos.position_id] || []), mw.id]),
+                    ];
                 }
             }
         }
-        setExclusions(exclusions);
-        const apiUrl = `results/${electionId}`;
-        const resp = (await fetcher.post.query([
-            apiUrl,
-            { json: { exclusions, manualOverrides } },
-        ])) as ApiResult;
-        setResults(resp.results);
+        for (const [positionId, candidateIds] of Object.entries(nextManualOverrides)) {
+            for (const candidateId of candidateIds) {
+                for (const position of results) {
+                    if (position.position_id !== positionId) {
+                        exclusions[position.position_id] = [
+                            ...new Set([...(exclusions[position.position_id] || []), candidateId]),
+                        ];
+                    }
+                }
+            }
+        }
+        for (const [positionId, candidateIds] of Object.entries(nextManualOverrides)) {
+            exclusions[positionId] = (exclusions[positionId] || []).filter(
+                (id) => !candidateIds.includes(id)
+            );
+        }
+        await submitAdjustments(exclusions, nextManualOverrides);
         setWinnerSelections({}); // Reset selections for next round if needed
     };
 
@@ -404,10 +459,13 @@ export default function Results({ electionId }: ResultsProps) {
                         <Button
                             className="mt-2"
                             color="primary"
-                            isDisabled={multiWinners.some((mw) => !winnerSelections[mw.id])}
+                            isDisabled={
+                                isAdjustingResults ||
+                                multiWinners.some((mw) => !winnerSelections[mw.id])
+                            }
                             onPress={handleConfirmSelections}
                         >
-                            Confirm Selections
+                            {isAdjustingResults ? 'Applying...' : 'Confirm Selections'}
                         </Button>
                     </CardBody>
                 </Card>
@@ -430,6 +488,12 @@ export default function Results({ electionId }: ResultsProps) {
                         </ul>
                     </CardBody>
                 </Card>
+            )}
+
+            {adjustmentError && (
+                <p className="mb-4 text-center text-red-600" role="alert">
+                    {adjustmentError}
+                </p>
             )}
 
             {sortedResults.map((position) => {
@@ -564,32 +628,46 @@ export default function Results({ electionId }: ResultsProps) {
                                                             ]?.includes(cand.id) ?? false
                                                         }
                                                         onChange={(e) => {
-                                                            const selected =
-                                                                manualOverrides[
-                                                                    position.position_id
-                                                                ] || [];
-                                                            if (e.target.checked) {
+                                                            setManualOverrides((prev) => {
+                                                                const selected =
+                                                                    prev[position.position_id] ||
+                                                                    [];
                                                                 if (
-                                                                    selected.length <
-                                                                    position.vacancies
+                                                                    e.target.checked &&
+                                                                    !selected.includes(cand.id) &&
+                                                                    selected.length >=
+                                                                        position.vacancies
                                                                 ) {
-                                                                    setManualOverrides((prev) => ({
-                                                                        ...prev,
-                                                                        [position.position_id]: [
-                                                                            ...selected,
-                                                                            cand.id,
-                                                                        ],
-                                                                    }));
+                                                                    return prev;
                                                                 }
-                                                            } else {
-                                                                setManualOverrides((prev) => ({
-                                                                    ...prev,
-                                                                    [position.position_id]:
-                                                                        selected.filter(
-                                                                            (id) => id !== cand.id
-                                                                        ),
-                                                                }));
-                                                            }
+                                                                const next = Object.fromEntries(
+                                                                    Object.entries(prev).map(
+                                                                        ([posId, ids]) => [
+                                                                            posId,
+                                                                            posId ===
+                                                                            position.position_id
+                                                                                ? ids
+                                                                                : ids.filter(
+                                                                                      (id) =>
+                                                                                          id !==
+                                                                                          cand.id
+                                                                                  ),
+                                                                        ]
+                                                                    )
+                                                                );
+                                                                next[position.position_id] = e
+                                                                    .target.checked
+                                                                    ? [
+                                                                          ...new Set([
+                                                                              ...selected,
+                                                                              cand.id,
+                                                                          ]),
+                                                                      ]
+                                                                    : selected.filter(
+                                                                          (id) => id !== cand.id
+                                                                      );
+                                                                return next;
+                                                            });
                                                         }}
                                                     />
                                                     {label}
@@ -600,6 +678,7 @@ export default function Results({ electionId }: ResultsProps) {
                                             className="mt-2"
                                             color="primary"
                                             size="sm"
+                                            isDisabled={isAdjustingResults}
                                             onPress={async () => {
                                                 // Build exclusions for manually overridden candidates to ensure only 1 position per person
                                                 const additionalExclusions: Record<
@@ -623,30 +702,38 @@ export default function Results({ electionId }: ResultsProps) {
                                                                 }
                                                                 additionalExclusions[
                                                                     otherPos.position_id
-                                                                ].push(winnerId);
+                                                                ] = [
+                                                                    ...new Set([
+                                                                        ...additionalExclusions[
+                                                                            otherPos.position_id
+                                                                        ],
+                                                                        winnerId,
+                                                                    ]),
+                                                                ];
                                                             }
                                                         }
                                                     }
                                                 }
-                                                const allExclusions = {
-                                                    ...exclusions,
-                                                    ...additionalExclusions,
-                                                };
-                                                const apiUrl = `results/${electionId}`;
-                                                const resp = (await fetcher.post.query([
-                                                    apiUrl,
-                                                    {
-                                                        json: {
-                                                            manualOverrides,
-                                                            exclusions: allExclusions,
-                                                        },
-                                                    },
-                                                ])) as ApiResult;
-                                                setResults(resp.results);
-                                                setExclusions(allExclusions); // Update exclusions to include manual ones
+                                                const allExclusions: Record<string, string[]> = {};
+                                                for (const pos of results) {
+                                                    const selectedManual =
+                                                        manualOverrides[pos.position_id] || [];
+                                                    allExclusions[pos.position_id] = [
+                                                        ...new Set([
+                                                            ...(exclusions[pos.position_id] || []),
+                                                            ...(additionalExclusions[
+                                                                pos.position_id
+                                                            ] || []),
+                                                        ]),
+                                                    ].filter((id) => !selectedManual.includes(id));
+                                                }
+                                                await submitAdjustments(
+                                                    allExclusions,
+                                                    manualOverrides
+                                                );
                                             }}
                                         >
-                                            Apply Manual Winners
+                                            {isAdjustingResults ? 'Applying...' : 'Apply Manual Winners'}
                                         </Button>
                                     </div>
                                 )}

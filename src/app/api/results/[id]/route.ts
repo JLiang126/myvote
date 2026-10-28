@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { db } from '@/db/index';
 import { ballots, candidatePositionLinks, candidates, positions } from '@/db/schema';
+import { isAdmin } from '@/utils/is-admin';
 import { hareclarkWithTallies } from '@/utils/hareclark';
 
 interface ResultCandidate {
@@ -22,6 +23,17 @@ interface ResultPosition {
     vacancies: number;
 }
 
+function isStringArrayMap(value: unknown): value is Record<string, string[]> {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.values(value).every(
+            (items) => Array.isArray(items) && items.every((item) => typeof item === 'string')
+        )
+    );
+}
+
 export async function GET(req: NextRequest) {
     // Expect /api/results/[id] where id is the election_id
 
@@ -29,14 +41,7 @@ export async function GET(req: NextRequest) {
     if (!session?.user || !session.accessToken) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-    let isAdmin = false;
-    try {
-        const decodedToken = JSON.parse(atob(session.accessToken.split('.')[1]));
-        isAdmin = decodedToken?.realm_access?.roles?.includes('myvote-admin');
-    } catch {
-        isAdmin = false;
-    }
-    if (!isAdmin) {
+    if (!isAdmin(session)) {
         return NextResponse.json({ error: 'Admin privileges required.' }, { status: 403 });
     }
     const { pathname } = new URL(req.url);
@@ -65,35 +70,40 @@ export async function GET(req: NextRequest) {
 
     // Get all candidate-position links for this election
     const allLinks = await db.select().from(candidatePositionLinks);
+    const electionPositions = await db
+        .select()
+        .from(positions)
+        .where(eq(positions.election, election_id));
 
     // Group ballots by position
     const grouped: Record<
         string,
         ResultPosition & { vacancies: number; ballots: string[][]; candidateIds: string[] }
     > = {};
+    for (const position of electionPositions) {
+        const posCandidateIds = allLinks
+            .filter((link) => link.position_id === position.id)
+            .map((link) => link.candidate_id);
+        const posCandidates = allCandidates.filter((candidate) =>
+            posCandidateIds.includes(candidate.id)
+        );
+        grouped[position.id] = {
+            position_id: position.id,
+            position_name: position.name,
+            winners: [],
+            candidates: [],
+            vacancies: position.vacancies,
+            ballots: [],
+            candidateIds: posCandidates.map((candidate) => candidate.id),
+        };
+    }
     for (const row of data) {
         const posId = row.position.id as string;
-        if (!grouped[posId]) {
-            // Only include candidates who have nominated for this position
-            const posCandidateIds = allLinks
-                .filter((link) => link.position_id === posId)
-                .map((link) => link.candidate_id);
-            const posCandidates = allCandidates.filter((cand) => posCandidateIds.includes(cand.id));
-            grouped[posId] = {
-                position_id: posId,
-                position_name: row.position.name,
-                winners: [],
-                candidates: [],
-                vacancies: row.position.vacancies,
-                ballots: [],
-                candidateIds: posCandidates.map((c) => c.id),
-            };
-        }
         // Parse preferences (array of candidate ids)
         const preferences: string[] = Array.isArray(row.ballot.preferences)
             ? row.ballot.preferences
             : [];
-        grouped[posId].ballots.push(preferences);
+        grouped[posId]?.ballots.push(preferences);
     }
 
     // For each position, run Hare-Clarke STV
@@ -197,6 +207,14 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+    const session = await auth();
+    if (!session?.user || !session.accessToken) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!isAdmin(session)) {
+        return NextResponse.json({ error: 'Admin privileges required.' }, { status: 403 });
+    }
+
     // Accept exclusions in the body: { exclusions: { [position_id]: string[] } }
     const { pathname } = new URL(req.url);
     const match = pathname.match(/\/api\/results\/(.+)$/);
@@ -204,9 +222,22 @@ export async function POST(req: NextRequest) {
     if (!election_id) {
         return NextResponse.json({ error: 'Missing election_id' }, { status: 400 });
     }
-    const body = await req.json();
-    const exclusions: Record<string, string[]> = body.exclusions || {};
-    const manualOverrides: Record<string, string[]> = body.manualOverrides || {};
+    let body: unknown;
+    try {
+        body = await req.json();
+    } catch {
+        return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+    if (!body || typeof body !== 'object') {
+        return NextResponse.json({ error: 'Invalid results adjustment' }, { status: 400 });
+    }
+    const rawExclusions = 'exclusions' in body ? body.exclusions : {};
+    const rawManualOverrides = 'manualOverrides' in body ? body.manualOverrides : {};
+    if (!isStringArrayMap(rawExclusions) || !isStringArrayMap(rawManualOverrides)) {
+        return NextResponse.json({ error: 'Invalid results adjustment' }, { status: 400 });
+    }
+    const exclusions = rawExclusions;
+    const manualOverrides = rawManualOverrides;
 
     // Get all ballots for this election, joined with positions
     const data = await db
@@ -226,35 +257,73 @@ export async function POST(req: NextRequest) {
 
     // Get all candidate-position links for this election
     const allLinks = await db.select().from(candidatePositionLinks);
+    const electionPositions = await db
+        .select()
+        .from(positions)
+        .where(eq(positions.election, election_id));
 
     // Group ballots by position
     const grouped: Record<
         string,
         ResultPosition & { vacancies: number; ballots: string[][]; candidateIds: string[] }
     > = {};
+    for (const position of electionPositions) {
+        const posCandidateIds = allLinks
+            .filter((link) => link.position_id === position.id)
+            .map((link) => link.candidate_id);
+        const posCandidates = allCandidates.filter((candidate) =>
+            posCandidateIds.includes(candidate.id)
+        );
+        grouped[position.id] = {
+            position_id: position.id,
+            position_name: position.name,
+            winners: [],
+            candidates: [],
+            vacancies: position.vacancies,
+            ballots: [],
+            candidateIds: posCandidates.map((candidate) => candidate.id),
+        };
+    }
     for (const row of data) {
         const posId = row.position.id as string;
-        if (!grouped[posId]) {
-            // Only include candidates who have nominated for this position
-            const posCandidateIds = allLinks
-                .filter((link) => link.position_id === posId)
-                .map((link) => link.candidate_id);
-            const posCandidates = allCandidates.filter((cand) => posCandidateIds.includes(cand.id));
-            grouped[posId] = {
-                position_id: posId,
-                position_name: row.position.name,
-                winners: [],
-                candidates: [],
-                vacancies: row.position.vacancies,
-                ballots: [],
-                candidateIds: posCandidates.map((c) => c.id),
-            };
-        }
         // Parse preferences (array of candidate ids)
         const preferences: string[] = Array.isArray(row.ballot.preferences)
             ? row.ballot.preferences
             : [];
-        grouped[posId].ballots.push(preferences);
+        grouped[posId]?.ballots.push(preferences);
+    }
+
+    const candidatesByPosition = new Map(
+        Object.values(grouped).map((position) => [
+            position.position_id,
+            new Set(position.candidateIds),
+        ])
+    );
+    const manuallyAssignedPositions = new Map<string, string>();
+    for (const [positionId, candidateIds] of Object.entries(manualOverrides)) {
+        const validCandidates = candidatesByPosition.get(positionId);
+        if (!validCandidates || candidateIds.length > grouped[positionId].vacancies) {
+            return NextResponse.json(
+                { error: `Invalid manual winners for position "${positionId}"` },
+                { status: 400 }
+            );
+        }
+        for (const candidateId of candidateIds) {
+            if (!validCandidates.has(candidateId)) {
+                return NextResponse.json(
+                    { error: `Candidate "${candidateId}" is not nominated for position "${positionId}"` },
+                    { status: 400 }
+                );
+            }
+            const assignedPosition = manuallyAssignedPositions.get(candidateId);
+            if (assignedPosition && assignedPosition !== positionId) {
+                return NextResponse.json(
+                    { error: `Candidate "${candidateId}" has multiple manual winner positions` },
+                    { status: 400 }
+                );
+            }
+            manuallyAssignedPositions.set(candidateId, positionId);
+        }
     }
 
     // Helper to run Hare-Clark for all positions with current exclusions
@@ -277,6 +346,53 @@ export async function POST(req: NextRequest) {
                     bordaScores[cid] = (bordaScores[cid] || 0) + (ballot.length - i);
                 }
             }
+            const manual = manualOverridesObj[pos.position_id];
+            if (manual && manual.length > 0) {
+                const winnerCands = [...new Set(manual)]
+                    .map((id) => posCandidates.find((c) => c.id === id))
+                    .filter(Boolean)
+                    .slice(0, pos.vacancies) as typeof posCandidates;
+                const candidateIds = posCandidatesFiltered.map((c) => String(c.id));
+                const ballots = pos.ballots.map((ballot) =>
+                    ballot.filter((cid) => !excluded.includes(cid)).map(String)
+                );
+                const tallies =
+                    pos.ballots.length > 0 && candidateIds.length > 0
+                        ? hareclarkWithTallies(candidateIds, ballots, pos.vacancies).tallies
+                        : {};
+                pos.winners = winnerCands.map((cand, idx) => ({
+                    id: cand.id,
+                    name: cand.name,
+                    ranking: idx + 1,
+                    total_points: tallies[cand.id] ?? 0,
+                    borda_points: bordaScores[cand.id] || 0,
+                    excluded: false,
+                }));
+                const manualIds = new Set(winnerCands.map((candidate) => candidate.id));
+                const sortedCandidates = [
+                    ...winnerCands,
+                    ...posCandidates
+                        .filter((candidate) => !manualIds.has(candidate.id))
+                        .sort((a, b) => {
+                            const pointsDiff =
+                                (tallies[b.id] ?? 0) - (tallies[a.id] ?? 0);
+                            if (pointsDiff !== 0) return pointsDiff;
+                            const bordaDiff =
+                                (bordaScores[b.id] ?? 0) - (bordaScores[a.id] ?? 0);
+                            if (bordaDiff !== 0) return bordaDiff;
+                            return a.name.localeCompare(b.name);
+                        }),
+                ];
+                pos.candidates = sortedCandidates.map((cand, idx) => ({
+                    id: cand.id,
+                    name: cand.name,
+                    ranking: idx + 1,
+                    total_points: tallies[cand.id] ?? 0,
+                    borda_points: bordaScores[cand.id] || 0,
+                    excluded: excluded.includes(cand.id) && !manualIds.has(cand.id),
+                }));
+                continue;
+            }
             if (posCandidatesFiltered.length === 0) {
                 pos.winners = [];
                 pos.candidates = posCandidates.map((c) => ({
@@ -287,80 +403,6 @@ export async function POST(req: NextRequest) {
                     borda_points: bordaScores[c.id] || 0,
                     excluded: excluded.includes(c.id),
                 }));
-                continue;
-            }
-            const manual = manualOverridesObj[pos.position_id];
-            if (manual && manual.length > 0) {
-                // Manual override: still compute points, but set winners manually
-                if (pos.ballots.length === 0) {
-                    // No points
-                    const winnerCands = manual
-                        .map((id) => posCandidates.find((c) => c.id === id))
-                        .filter(Boolean) as typeof posCandidates;
-                    pos.winners = winnerCands.map((cand, idx) => ({
-                        id: cand.id,
-                        name: cand.name,
-                        ranking: idx + 1,
-                        total_points: 0,
-                        borda_points: bordaScores[cand.id] || 0,
-                        excluded: false,
-                    }));
-                    const sortedCandidates = [
-                        ...winnerCands,
-                        ...posCandidates
-                            .filter((c) => !manual.includes(c.id))
-                            .sort((a, b) => a.name.localeCompare(b.name)),
-                    ];
-                    pos.candidates = sortedCandidates.map((cand, idx: number) => ({
-                        id: cand.id,
-                        name: cand.name,
-                        ranking: idx + 1,
-                        total_points: 0,
-                        borda_points: bordaScores[cand.id] || 0,
-                        excluded: false,
-                    }));
-                    continue;
-                }
-                const candidateIds = posCandidates.map((c) => String(c.id));
-                const ballots = pos.ballots.map((ballot) =>
-                    ballot.filter((cid) => !excluded.includes(cid)).map((cid) => String(cid))
-                );
-                const { tallies } = hareclarkWithTallies(candidateIds, ballots, pos.vacancies);
-                // Manual winners
-                const winnerCands = manual
-                    .map((id) => posCandidates.find((c) => c.id === id))
-                    .filter(Boolean) as typeof posCandidates;
-                pos.winners = winnerCands.map((cand, idx) => ({
-                    id: cand.id,
-                    name: cand.name,
-                    ranking: idx + 1,
-                    total_points: tallies[cand.id] ?? 0,
-                    borda_points: bordaScores[cand.id] || 0,
-                    excluded: false,
-                }));
-                const sortedCandidates = [
-                    ...winnerCands,
-                    ...posCandidates
-                        .filter((c) => !manual.includes(c.id))
-                        .sort((a, b) => {
-                            // Sort by Hare-Clark tallies desc, then Borda desc, then name
-                            const hcDiff = (tallies[b.id] ?? 0) - (tallies[a.id] ?? 0);
-                            if (hcDiff !== 0) return hcDiff;
-                            const bordaDiff = (bordaScores[b.id] ?? 0) - (bordaScores[a.id] ?? 0);
-                            if (bordaDiff !== 0) return bordaDiff;
-                            return a.name.localeCompare(b.name);
-                        }),
-                ];
-                pos.candidates = sortedCandidates.map((cand, idx: number) => ({
-                    id: String(cand.id),
-                    name: cand.name,
-                    ranking: idx + 1,
-                    total_points: tallies[cand.id] ?? 0,
-                    borda_points: bordaScores[cand.id] || 0,
-                    excluded: false,
-                }));
-                // @ts-expect-error: attach for debug only
-                pos.hareclarkTallies = tallies;
                 continue;
             }
             if (pos.ballots.length === 0) {

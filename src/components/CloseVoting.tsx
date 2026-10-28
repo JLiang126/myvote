@@ -9,9 +9,14 @@ import { fetcher } from '../lib/fetcher';
 interface CloseVotingProps {
     electionId: string;
     setSliderValue: React.Dispatch<React.SetStateAction<number>>;
+    onStatusUpdated: () => void;
 }
 
-export default function CloseVoting({ electionId, setSliderValue }: CloseVotingProps) {
+export default function CloseVoting({
+    electionId,
+    setSliderValue,
+    onStatusUpdated,
+}: CloseVotingProps) {
     const [status, setStatus] = useState({ text: '', type: '' });
 
     const updateElectionStatus = useSWRMutation(
@@ -25,6 +30,7 @@ export default function CloseVoting({ electionId, setSliderValue }: CloseVotingP
                 });
             },
             onSuccess: () => {
+                onStatusUpdated();
                 setStatus({
                     text: 'Election status updated successfully!',
                     type: 'success',

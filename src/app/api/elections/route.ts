@@ -74,7 +74,7 @@ export async function GET() {
         return NextResponse.json(electionInfo, {
             status: 200,
             headers: {
-                'Cache-Control': 'private, max-age=300',
+                'Cache-Control': 'private, no-store, max-age=0',
                 'Content-Type': 'application/json',
             },
         });

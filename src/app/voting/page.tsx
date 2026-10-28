@@ -38,6 +38,8 @@ export default function VotingPage() {
 
     // Shared SWR fetcher
     const swrFetcher = async (url: string) => fetch(url).then((res) => res.json());
+    const electionsFetcher = async (url: string) =>
+        fetch(url, { cache: 'no-store' }).then((res) => res.json());
 
     // Fetch membership info using hook
     const { data: membershipData } = useSWR(
@@ -85,11 +87,15 @@ export default function VotingPage() {
     // Fetch election data with proper SWR caching
     const { data: electionsData, isLoading: electionsLoading } = useSWR(
         '/api/elections',
-        swrFetcher,
-        SWR_CONFIG
+        electionsFetcher,
+        {
+            ...SWR_CONFIG,
+            revalidateOnFocus: true,
+            refreshInterval: 10000,
+        }
     );
 
-    const firstElection = useMemo<{ id: number; status: number } | null>(() => {
+    const firstElection = useMemo<{ id: string; status: string | number } | null>(() => {
         if (electionsData && electionsData.length > 0) {
             const votingElection = electionsData.find(
                 (e: { status: string | number }) => e.status === 'Voting' || e.status === 3
@@ -98,6 +104,20 @@ export default function VotingPage() {
         }
         return null;
     }, [electionsData]);
+
+    const electionStatusOrder: Record<string, number> = {
+        PreRelease: 0,
+        Nominations: 1,
+        NominationsClosed: 2,
+        Voting: 3,
+        VotingClosed: 4,
+        ResultsReleased: 5,
+    };
+    const electionStatusValue = firstElection
+        ? typeof firstElection.status === 'number'
+            ? firstElection.status
+            : electionStatusOrder[firstElection.status]
+        : -1;
 
     // Update localStorage when voting order changes
     const setCandidatesWithStorage = useCallback<
@@ -158,10 +178,10 @@ export default function VotingPage() {
         if (!firstElection) {
             return 'No open elections available.';
         }
-        if (firstElection.status < 3) {
+        if (electionStatusValue < 3) {
             return "Voting hasn't opened yet.";
         }
-        if (firstElection.status > 3) {
+        if (electionStatusValue > 3) {
             return 'Voting has closed.';
         }
         if (isMember === false) {
@@ -171,7 +191,7 @@ export default function VotingPage() {
             return 'You have already voted.';
         }
         return '';
-    }, [canEditVote, electionsLoading, firstElection, hasVoted, isMember]);
+    }, [canEditVote, electionsLoading, electionStatusValue, firstElection, hasVoted, isMember]);
 
     // Handle submit vote
     const submitVote = useSWRMutation(

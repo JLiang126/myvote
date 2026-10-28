@@ -25,7 +25,7 @@ export default function ChooseElection({
     // Fetch elections from API
     const handleSelectExistingElection = async () => {
         try {
-            const res = await fetch('/api/elections');
+            const res = await fetch('/api/elections', { cache: 'no-store' });
             if (!res.ok) throw new Error('Failed to fetch elections');
             const data = await res.json();
             setElections(data);
